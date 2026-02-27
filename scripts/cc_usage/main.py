@@ -7,6 +7,7 @@ import json
 import os
 import re
 import signal
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -57,6 +58,7 @@ OUTPUT_RE = re.compile(r"(?:output_tokens|completion_tokens)\s*[:=]\s*(\d+)")
 SESSION_RE = re.compile(r"session(?:_id)?\s*[:=]\s*([A-Za-z0-9._:-]+)")
 REQUEST_RE = re.compile(r"request(?:_id)?\s*[:=]\s*([A-Za-z0-9._:-]+)")
 LATENCY_RE = re.compile(r"(?:latency_ms|duration_ms)\s*[:=]\s*(\d+)")
+PERCENT_RE = re.compile(r"(?<!\d)(100|[1-9]?\d)\s*%")
 
 
 @dataclass(frozen=True)
@@ -168,6 +170,43 @@ def atomic_write_text(path: Path, text: str) -> None:
 
 def default_status_file() -> Path:
     return Path(os.path.expanduser("~/.cache/cc-usage/status.json")).resolve()
+
+
+def default_manual_remaining_file() -> Path:
+    return Path(os.path.expanduser("~/.cache/cc-usage/claude-remaining.json")).resolve()
+
+
+def read_manual_remaining_percent(path: Path | None = None) -> float | None:
+    target = path or default_manual_remaining_file()
+    if not target.exists():
+        return None
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        value = payload.get("remaining_percent")
+        if value is None:
+            return None
+        result = float(value)
+        if result < 0 or result > 100:
+            return None
+        return result
+    except Exception:
+        return None
+
+
+def write_manual_remaining_percent(percent: float, path: Path | None = None) -> Path:
+    target = path or default_manual_remaining_file()
+    atomic_write_text(
+        target,
+        json.dumps(
+            {
+                "remaining_percent": float(percent),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+    )
+    return target
 
 
 def nested_get(data: dict[str, Any], *paths: str) -> Any:
@@ -668,12 +707,9 @@ def query_latest_rate_limits(conn: Any, project: str | None = None, session_id: 
             CASE
                 WHEN (raw_payload #>> '{{payload,rate_limits,primary,window_minutes}}') = '300'
                      AND (raw_payload #>> '{{payload,rate_limits,limit_name}}') IS NULL THEN 0
-                WHEN (raw_payload #>> '{{payload,rate_limits,primary,window_minutes}}') = '300'
-                     AND (raw_payload #>> '{{payload,rate_limits,limit_id}}') = 'codex' THEN 1
-                WHEN (raw_payload #>> '{{payload,rate_limits,primary,window_minutes}}') = '300' THEN 2
-                ELSE 3
+                WHEN (raw_payload #>> '{{payload,rate_limits,primary,window_minutes}}') = '300' THEN 1
+                ELSE 2
             END,
-            COALESCE(NULLIF(raw_payload #>> '{{payload,rate_limits,primary,used_percent}}', '')::double precision, -1) DESC,
             e.ts DESC
         LIMIT 1
     """
@@ -911,7 +947,7 @@ def resolve_source_file(source_file: str | None) -> tuple[Path | None, bool]:
     source_file = source_file or os.getenv("CC_USAGE_SOURCE_FILE", "").strip()
     if source_file:
         return Path(source_file).expanduser().resolve(), False
-    return detect_latest_codex_session_file(), True
+    return detect_latest_session_file(), True
 
 
 def build_status_snapshot(
@@ -927,6 +963,7 @@ def build_status_snapshot(
     today = query_today_summary(conn, cfg.local_tz, project=project, session_id=session_id)
     recent = query_recent_rate(conn, minutes=recent_minutes, project=project, session_id=session_id)
     rate_limits = query_latest_rate_limits(conn, project=project, session_id=session_id)
+    manual_remaining = read_manual_remaining_percent()
     now_utc = datetime.now(timezone.utc)
     last_age = None
     if last_ingest_at is not None:
@@ -940,6 +977,7 @@ def build_status_snapshot(
         "last_ingest_age_sec": last_age,
         "recent_minutes": recent_minutes,
         "rate_limits": rate_limits,
+        "manual_remaining_percent": manual_remaining,
         "recent": {
             "requests": int(recent["requests"] or 0),
             "input_tokens": int(recent["input_tokens"] or 0),
@@ -966,12 +1004,25 @@ def format_status_line(status: dict[str, Any], fmt: str) -> str:
     today_cost = Decimal(str(today.get("cost", 0.0) or 0.0))
     state = status.get("collector_state", "UNKNOWN")
     rate_limits = status.get("rate_limits", {})
+    manual_remaining = status.get("manual_remaining_percent")
     primary_remaining = rate_limits.get("primary_remaining_percent")
-    rl_text = "-" if primary_remaining is None else f"{float(primary_remaining):.0f}%"
+    secondary_remaining = rate_limits.get("secondary_remaining_percent")
+    remaining = manual_remaining
+    if remaining is None:
+        remaining = primary_remaining if primary_remaining is not None else secondary_remaining
+    used_text = "N/A" if remaining is None else f"{max(0.0, 100.0 - float(remaining)):.0f}%"
+
+    if fmt == "tmux":
+        return (
+            f"클로드5h사용:{used_text} R:{req_per_min}/m "
+            f"I/O:{compact_int(in_per_min)}/{compact_int(out_per_min)} T:{compact_int(today_total_tok)}"
+        )
+    if fmt == "zsh":
+        return f"클로드5h사용:{used_text} R:{req_per_min}/m T:{compact_int(today_total_tok)}"
 
     base = (
-        f"CC R:{req_per_min}/m I/O:{compact_int(in_per_min)}/{compact_int(out_per_min)} "
-        f"T:{compact_int(today_total_tok)} RL:{rl_text} ${today_cost:.4f} SRC:{state}"
+        f"ClaudeCode R:{req_per_min}/m I/O:{compact_int(in_per_min)}/{compact_int(out_per_min)} "
+        f"T:{compact_int(today_total_tok)} 클로드5시간사용:{used_text} ${today_cost:.4f} SRC:{state}"
     )
     if fmt == "json":
         return json.dumps(status, ensure_ascii=False)
@@ -1009,12 +1060,30 @@ def run_collector_iteration(
     )
 
 
+def detect_latest_claude_session_file() -> Path | None:
+    candidates = glob(os.path.expanduser("~/.claude/projects/**/*.jsonl"), recursive=True)
+    if not candidates:
+        return None
+    latest = max(candidates, key=lambda p: os.path.getmtime(p))
+    return Path(latest).resolve()
+
+
 def detect_latest_codex_session_file() -> Path | None:
     candidates = glob(os.path.expanduser("~/.codex/sessions/*/*/*/*.jsonl"))
     if not candidates:
         return None
     latest = max(candidates, key=lambda p: os.path.getmtime(p))
     return Path(latest).resolve()
+
+
+def detect_latest_session_file() -> Path | None:
+    # Default to Claude Code sessions only.
+    claude_latest = detect_latest_claude_session_file()
+    if claude_latest is not None:
+        return claude_latest
+    if os.getenv("CC_USAGE_ALLOW_CODEX_FALLBACK", "0") == "1":
+        return detect_latest_codex_session_file()
+    return None
 
 
 def command_collect(
@@ -1032,10 +1101,10 @@ def command_collect(
 
     source_path, auto_source = resolve_source_file(source_file)
     if source_path is None:
-        raise RuntimeError("No source file found. Use --source-file or create a Codex session log under ~/.codex/sessions.")
+        raise RuntimeError("No source file found. Use --source-file or create a Claude/Codex session log.")
     source_key = str(source_path)
     project_name = project or os.getenv("CC_USAGE_PROJECT", "default")
-    default_model_name = default_model or os.getenv("CC_USAGE_DEFAULT_MODEL", "codex")
+    default_model_name = default_model or os.getenv("CC_USAGE_DEFAULT_MODEL", "claude-opus-4-6")
     session_hint = source_path.stem.rsplit("-", 1)[-1] if source_path.suffix == ".jsonl" else None
 
     console.print(f"[bold]collector[/bold] source={source_key}")
@@ -1047,7 +1116,7 @@ def command_collect(
         offset: int | None = None
         while not STOP:
             if auto_source:
-                latest = detect_latest_codex_session_file()
+                latest = detect_latest_session_file()
                 if latest and str(latest) != source_key:
                     source_path = latest
                     source_key = str(source_path)
@@ -1101,10 +1170,10 @@ def command_daemon(
 
     source_path, auto_source = resolve_source_file(source_file)
     if source_path is None:
-        raise RuntimeError("No source file found. Use --source-file or create a Codex session log under ~/.codex/sessions.")
+        raise RuntimeError("No source file found. Use --source-file or create a Claude/Codex session log.")
     source_key = str(source_path)
     project_name = project or os.getenv("CC_USAGE_PROJECT", "default")
-    default_model_name = default_model or os.getenv("CC_USAGE_DEFAULT_MODEL", "codex")
+    default_model_name = default_model or os.getenv("CC_USAGE_DEFAULT_MODEL", "claude-opus-4-6")
     session_hint = source_path.stem.rsplit("-", 1)[-1] if source_path.suffix == ".jsonl" else None
     status_path = Path(status_file).expanduser().resolve() if status_file else default_status_file()
     session_id_filter = None
@@ -1123,7 +1192,7 @@ def command_daemon(
             collector_state = "OK"
 
             if auto_source:
-                latest = detect_latest_codex_session_file()
+                latest = detect_latest_session_file()
                 if latest and str(latest) != source_key:
                     source_path = latest
                     source_key = str(source_path)
@@ -1179,6 +1248,9 @@ def command_status(
     status_path = Path(status_file).expanduser().resolve() if status_file else default_status_file()
     if not from_db and status_path.exists():
         payload = json.loads(status_path.read_text(encoding="utf-8"))
+        manual_remaining = read_manual_remaining_percent()
+        if manual_remaining is not None:
+            payload["manual_remaining_percent"] = manual_remaining
         console.print(format_status_line(payload, fmt))
         return 0
 
@@ -1193,6 +1265,123 @@ def command_status(
             last_ingest_at=None,
         )
     console.print(format_status_line(payload, fmt))
+    return 0
+
+
+def command_set_remaining(percent: float) -> int:
+    if percent < 0 or percent > 100:
+        raise RuntimeError("--percent must be between 0 and 100")
+    path = write_manual_remaining_percent(percent)
+    console.print(f"manual remaining updated: {percent:.0f}% ({path})")
+    return 0
+
+
+def command_set_remaining_from_clipboard() -> int:
+    try:
+        text = subprocess.check_output(["pbpaste"], text=True, stderr=subprocess.DEVNULL)
+    except Exception as exc:
+        raise RuntimeError(f"failed to read clipboard: {exc}") from exc
+    m = re.search(r"(\d{1,3})\s*%", text)
+    if not m:
+        raise RuntimeError("no percent value found in clipboard text")
+    percent = float(m.group(1))
+    return command_set_remaining(percent)
+
+
+def extract_usage_percent_from_text(text: str) -> float | None:
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if "current session" in line.lower():
+            for j in range(i, min(i + 6, len(lines))):
+                m = re.search(r"(?<!\d)(100|[1-9]?\d)\s*%\s*used", lines[j], flags=re.IGNORECASE)
+                if m:
+                    used = float(m.group(1))
+                    return max(0.0, 100.0 - used)
+
+    candidates: list[tuple[int, float]] = []
+    for line in lines:
+        m = PERCENT_RE.search(line)
+        if not m:
+            continue
+        percent = float(m.group(1))
+        score = 0
+        lower = line.lower()
+        if "usage" in lower:
+            score += 4
+        if "used" in lower:
+            score += 2
+        if "remaining" in lower or "잔여" in line or "남은" in line:
+            score += 4
+        if "5h" in lower or "5시간" in line or "5-hour" in lower:
+            score += 4
+        if "rate" in lower or "limit" in lower:
+            score += 2
+        if score == 0:
+            score = 1
+        candidates.append((score, percent))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def tmux_has_session(name: str) -> bool:
+    proc = subprocess.run(["tmux", "has-session", "-t", name], capture_output=True, text=True)
+    return proc.returncode == 0
+
+
+def ensure_usage_tmux_session(name: str, cwd: str) -> None:
+    if tmux_has_session(name):
+        return
+    subprocess.run(["tmux", "new-session", "-d", "-s", name, "-c", cwd, "claude"], check=False)
+    time.sleep(1.0)
+
+
+def tmux_request_usage_percent(name: str, settle_sec: float = 1.4) -> float | None:
+    if not tmux_has_session(name):
+        return None
+    subprocess.run(["tmux", "send-keys", "-t", name, "/usage", "Enter"], check=False)
+    time.sleep(0.25)
+    subprocess.run(["tmux", "send-keys", "-t", name, "Enter"], check=False)
+    time.sleep(max(settle_sec, 0.6))
+    proc = subprocess.run(["tmux", "capture-pane", "-pt", name, "-S", "-220"], capture_output=True, text=True)
+    if proc.returncode != 0:
+        return None
+    result = extract_usage_percent_from_text(proc.stdout)
+    subprocess.run(["tmux", "send-keys", "-t", name, "Escape"], check=False)
+    return result
+
+
+def estimate_remaining_percent() -> float | None:
+    # Conservative fallback: keep latest manual value when direct /usage parse is unavailable.
+    return read_manual_remaining_percent()
+
+
+def command_sync_remaining(
+    interval: float,
+    tmux_session: str,
+    tmux_cwd: str | None,
+    no_tmux_bootstrap: bool,
+) -> int:
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+    cwd = tmux_cwd or str(Path.home())
+    if not no_tmux_bootstrap:
+        ensure_usage_tmux_session(tmux_session, cwd)
+
+    console.print(f"[bold]sync-remaining[/bold] session={tmux_session} interval={interval:.1f}s")
+    while not STOP:
+        percent = tmux_request_usage_percent(tmux_session)
+        source = "tmux:/usage"
+        if percent is None:
+            percent = estimate_remaining_percent()
+            source = "estimate"
+        if percent is not None:
+            write_manual_remaining_percent(percent)
+            console.print(f"[cyan]remaining[/cyan] {percent:.0f}% ({source})")
+        else:
+            console.print("[yellow]remaining unavailable[/yellow] (/usage parse failed)")
+        time.sleep(max(interval, 3.0))
     return 0
 
 
@@ -1300,6 +1489,21 @@ def parse_args() -> argparse.Namespace:
     status.add_argument("--status-file", help="status cache path (default: ~/.cache/cc-usage/status.json)")
     status.add_argument("--from-db", action="store_true", help="ignore cache file and query DB directly")
 
+    set_remaining = subparsers.add_parser(
+        "set-remaining", help="set Claude 5-hour remaining percent manually (from /usage)"
+    )
+    set_group = set_remaining.add_mutually_exclusive_group(required=True)
+    set_group.add_argument("--percent", type=float, help="remaining percent, e.g. 71")
+    set_group.add_argument("--from-clipboard", action="store_true", help="read first %% value from clipboard text")
+
+    sync_remaining = subparsers.add_parser(
+        "sync-remaining", help="hybrid sync: periodic /usage parse in tmux + fallback to estimate"
+    )
+    sync_remaining.add_argument("--interval", type=float, default=30.0, help="sync interval seconds")
+    sync_remaining.add_argument("--tmux-session", default="cc-usage-sync", help="tmux session name for /usage polling")
+    sync_remaining.add_argument("--tmux-cwd", help="cwd for auto-created tmux session")
+    sync_remaining.add_argument("--no-tmux-bootstrap", action="store_true", help="do not auto-create tmux session")
+
     return parser.parse_args()
 
 
@@ -1349,6 +1553,17 @@ def main() -> int:
                 session_id=args.session,
                 status_file=args.status_file,
                 from_db=args.from_db,
+            )
+        if args.command == "set-remaining":
+            if args.from_clipboard:
+                return command_set_remaining_from_clipboard()
+            return command_set_remaining(args.percent)
+        if args.command == "sync-remaining":
+            return command_sync_remaining(
+                interval=args.interval,
+                tmux_session=args.tmux_session,
+                tmux_cwd=args.tmux_cwd,
+                no_tmux_bootstrap=args.no_tmux_bootstrap,
             )
         console.print(f"[red]unknown command:[/red] {args.command}")
         return 1
