@@ -652,6 +652,9 @@ def query_latest_rate_limits(conn: Any, project: str | None = None, session_id: 
     extra_where, params = where_project_session(project, session_id)
     sql = f"""
         SELECT
+            raw_payload #>> '{{payload,rate_limits,limit_id}}' AS limit_id,
+            raw_payload #>> '{{payload,rate_limits,limit_name}}' AS limit_name,
+            NULLIF(raw_payload #>> '{{payload,rate_limits,primary,window_minutes}}', '')::double precision AS primary_window_minutes,
             NULLIF(raw_payload #>> '{{payload,rate_limits,primary,used_percent}}', '')::double precision AS primary_used_percent,
             NULLIF(raw_payload #>> '{{payload,rate_limits,secondary,used_percent}}', '')::double precision AS secondary_used_percent
         FROM usage_events e
@@ -661,7 +664,17 @@ def query_latest_rate_limits(conn: Any, project: str | None = None, session_id: 
             (raw_payload #>> '{{payload,rate_limits,primary,used_percent}}') IS NOT NULL
             OR (raw_payload #>> '{{payload,rate_limits,secondary,used_percent}}') IS NOT NULL
           )
-        ORDER BY e.ts DESC
+        ORDER BY
+            CASE
+                WHEN (raw_payload #>> '{{payload,rate_limits,primary,window_minutes}}') = '300'
+                     AND (raw_payload #>> '{{payload,rate_limits,limit_name}}') IS NULL THEN 0
+                WHEN (raw_payload #>> '{{payload,rate_limits,primary,window_minutes}}') = '300'
+                     AND (raw_payload #>> '{{payload,rate_limits,limit_id}}') = 'codex' THEN 1
+                WHEN (raw_payload #>> '{{payload,rate_limits,primary,window_minutes}}') = '300' THEN 2
+                ELSE 3
+            END,
+            COALESCE(NULLIF(raw_payload #>> '{{payload,rate_limits,primary,used_percent}}', '')::double precision, -1) DESC,
+            e.ts DESC
         LIMIT 1
     """
     with get_cursor(conn) as cur:
@@ -679,6 +692,9 @@ def query_latest_rate_limits(conn: Any, project: str | None = None, session_id: 
     primary_remain = None if primary_used is None else max(0.0, 100.0 - float(primary_used))
     secondary_remain = None if secondary_used is None else max(0.0, 100.0 - float(secondary_used))
     return {
+        "limit_id": row.get("limit_id"),
+        "limit_name": row.get("limit_name"),
+        "primary_window_minutes": None if row.get("primary_window_minutes") is None else float(row.get("primary_window_minutes")),
         "primary_used_percent": None if primary_used is None else float(primary_used),
         "primary_remaining_percent": primary_remain,
         "secondary_used_percent": None if secondary_used is None else float(secondary_used),
