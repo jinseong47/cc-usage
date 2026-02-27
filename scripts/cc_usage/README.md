@@ -87,6 +87,18 @@ set -g status-interval 2
 set -g status-right '#(/usr/bin/env DATABASE_URL=postgresql://localhost:5432/cc_usage python3 /Users/ijinseong/Documents/golf/dy_golfcart_monitoring/scripts/cc_usage/main.py status --format tmux) | %H:%M'
 ```
 
+Always run Claude/Codex inside tmux session:
+
+```bash
+tmux new -As main
+```
+
+Reload tmux config after update:
+
+```bash
+tmux source-file ~/.tmux.conf
+```
+
 zsh (`~/.zshrc`):
 
 ```bash

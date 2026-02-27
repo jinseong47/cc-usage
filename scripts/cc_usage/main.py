@@ -648,6 +648,44 @@ def query_recent_rate(
         return cur.fetchone()
 
 
+def query_latest_rate_limits(conn: Any, project: str | None = None, session_id: str | None = None) -> dict[str, float | None]:
+    extra_where, params = where_project_session(project, session_id)
+    sql = f"""
+        SELECT
+            NULLIF(raw_payload #>> '{{payload,rate_limits,primary,used_percent}}', '')::double precision AS primary_used_percent,
+            NULLIF(raw_payload #>> '{{payload,rate_limits,secondary,used_percent}}', '')::double precision AS secondary_used_percent
+        FROM usage_events e
+        WHERE 1=1
+          {f"AND {extra_where}" if extra_where else ""}
+          AND (
+            (raw_payload #>> '{{payload,rate_limits,primary,used_percent}}') IS NOT NULL
+            OR (raw_payload #>> '{{payload,rate_limits,secondary,used_percent}}') IS NOT NULL
+          )
+        ORDER BY e.ts DESC
+        LIMIT 1
+    """
+    with get_cursor(conn) as cur:
+        cur.execute(sql, params)
+        row = cur.fetchone()
+    if not row:
+        return {
+            "primary_used_percent": None,
+            "primary_remaining_percent": None,
+            "secondary_used_percent": None,
+            "secondary_remaining_percent": None,
+        }
+    primary_used = row["primary_used_percent"]
+    secondary_used = row["secondary_used_percent"]
+    primary_remain = None if primary_used is None else max(0.0, 100.0 - float(primary_used))
+    secondary_remain = None if secondary_used is None else max(0.0, 100.0 - float(secondary_used))
+    return {
+        "primary_used_percent": None if primary_used is None else float(primary_used),
+        "primary_remaining_percent": primary_remain,
+        "secondary_used_percent": None if secondary_used is None else float(secondary_used),
+        "secondary_remaining_percent": secondary_remain,
+    }
+
+
 def query_top_projects_today(conn: Any, tz_name: str, top_n: int = 5) -> list[dict[str, Any]]:
     sql = """
         SELECT
@@ -872,6 +910,7 @@ def build_status_snapshot(
 ) -> dict[str, Any]:
     today = query_today_summary(conn, cfg.local_tz, project=project, session_id=session_id)
     recent = query_recent_rate(conn, minutes=recent_minutes, project=project, session_id=session_id)
+    rate_limits = query_latest_rate_limits(conn, project=project, session_id=session_id)
     now_utc = datetime.now(timezone.utc)
     last_age = None
     if last_ingest_at is not None:
@@ -884,6 +923,7 @@ def build_status_snapshot(
         "collector_state": collector_state,
         "last_ingest_age_sec": last_age,
         "recent_minutes": recent_minutes,
+        "rate_limits": rate_limits,
         "recent": {
             "requests": int(recent["requests"] or 0),
             "input_tokens": int(recent["input_tokens"] or 0),
@@ -909,10 +949,13 @@ def format_status_line(status: dict[str, Any], fmt: str) -> str:
     today_total_tok = int(today.get("input_tokens", 0) or 0) + int(today.get("output_tokens", 0) or 0)
     today_cost = Decimal(str(today.get("cost", 0.0) or 0.0))
     state = status.get("collector_state", "UNKNOWN")
+    rate_limits = status.get("rate_limits", {})
+    primary_remaining = rate_limits.get("primary_remaining_percent")
+    rl_text = "-" if primary_remaining is None else f"{float(primary_remaining):.0f}%"
 
     base = (
         f"CC R:{req_per_min}/m I/O:{compact_int(in_per_min)}/{compact_int(out_per_min)} "
-        f"T:{compact_int(today_total_tok)} ${today_cost:.4f} SRC:{state}"
+        f"T:{compact_int(today_total_tok)} RL:{rl_text} ${today_cost:.4f} SRC:{state}"
     )
     if fmt == "json":
         return json.dumps(status, ensure_ascii=False)
