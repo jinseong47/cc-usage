@@ -176,35 +176,53 @@ def default_manual_remaining_file() -> Path:
     return Path(os.path.expanduser("~/.cache/cc-usage/claude-remaining.json")).resolve()
 
 
-def read_manual_remaining_percent(path: Path | None = None) -> float | None:
+def read_manual_sync_payload(path: Path | None = None) -> dict[str, Any]:
     target = path or default_manual_remaining_file()
     if not target.exists():
-        return None
+        return {}
     try:
         payload = json.loads(target.read_text(encoding="utf-8"))
-        value = payload.get("remaining_percent")
-        if value is None:
-            return None
+        if isinstance(payload, dict):
+            return payload
+        return {}
+    except Exception:
+        return {}
+
+
+def read_manual_remaining_percent(path: Path | None = None) -> float | None:
+    payload = read_manual_sync_payload(path)
+    value = payload.get("remaining_percent")
+    if value is None:
+        return None
+    try:
         result = float(value)
-        if result < 0 or result > 100:
-            return None
-        return result
     except Exception:
         return None
+    if result < 0 or result > 100:
+        return None
+    return result
 
 
-def write_manual_remaining_percent(percent: float, path: Path | None = None) -> Path:
+def read_manual_reset_text(path: Path | None = None) -> str | None:
+    payload = read_manual_sync_payload(path)
+    value = payload.get("reset_text")
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def write_manual_remaining_percent(percent: float, path: Path | None = None, reset_text: str | None = None) -> Path:
     target = path or default_manual_remaining_file()
+    payload = {
+        "remaining_percent": float(percent),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if reset_text:
+        payload["reset_text"] = reset_text.strip()
     atomic_write_text(
         target,
-        json.dumps(
-            {
-                "remaining_percent": float(percent),
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
+        json.dumps(payload, ensure_ascii=False, indent=2),
     )
     return target
 
@@ -964,6 +982,7 @@ def build_status_snapshot(
     recent = query_recent_rate(conn, minutes=recent_minutes, project=project, session_id=session_id)
     rate_limits = query_latest_rate_limits(conn, project=project, session_id=session_id)
     manual_remaining = read_manual_remaining_percent()
+    manual_reset_text = read_manual_reset_text()
     now_utc = datetime.now(timezone.utc)
     last_age = None
     if last_ingest_at is not None:
@@ -978,6 +997,7 @@ def build_status_snapshot(
         "recent_minutes": recent_minutes,
         "rate_limits": rate_limits,
         "manual_remaining_percent": manual_remaining,
+        "manual_reset_text": manual_reset_text,
         "recent": {
             "requests": int(recent["requests"] or 0),
             "input_tokens": int(recent["input_tokens"] or 0),
@@ -1005,24 +1025,26 @@ def format_status_line(status: dict[str, Any], fmt: str) -> str:
     state = status.get("collector_state", "UNKNOWN")
     rate_limits = status.get("rate_limits", {})
     manual_remaining = status.get("manual_remaining_percent")
+    manual_reset_text = (status.get("manual_reset_text") or "").strip()
     primary_remaining = rate_limits.get("primary_remaining_percent")
     secondary_remaining = rate_limits.get("secondary_remaining_percent")
     remaining = manual_remaining
     if remaining is None:
         remaining = primary_remaining if primary_remaining is not None else secondary_remaining
     used_text = "N/A" if remaining is None else f"{max(0.0, 100.0 - float(remaining)):.0f}%"
+    reset_part = "" if not manual_reset_text else f" 초기화:{manual_reset_text}"
 
     if fmt == "tmux":
         return (
-            f"클로드5h사용:{used_text} R:{req_per_min}/m "
+            f"클로드5h사용:{used_text}{reset_part} R:{req_per_min}/m "
             f"I/O:{compact_int(in_per_min)}/{compact_int(out_per_min)} T:{compact_int(today_total_tok)}"
         )
     if fmt == "zsh":
-        return f"클로드5h사용:{used_text} R:{req_per_min}/m T:{compact_int(today_total_tok)}"
+        return f"클로드5h사용:{used_text}{reset_part} R:{req_per_min}/m T:{compact_int(today_total_tok)}"
 
     base = (
         f"ClaudeCode R:{req_per_min}/m I/O:{compact_int(in_per_min)}/{compact_int(out_per_min)} "
-        f"T:{compact_int(today_total_tok)} 클로드5시간사용:{used_text} ${today_cost:.4f} SRC:{state}"
+        f"T:{compact_int(today_total_tok)} 클로드5시간사용:{used_text}{reset_part} ${today_cost:.4f} SRC:{state}"
     )
     if fmt == "json":
         return json.dumps(status, ensure_ascii=False)
@@ -1249,8 +1271,11 @@ def command_status(
     if not from_db and status_path.exists():
         payload = json.loads(status_path.read_text(encoding="utf-8"))
         manual_remaining = read_manual_remaining_percent()
+        manual_reset_text = read_manual_reset_text()
         if manual_remaining is not None:
             payload["manual_remaining_percent"] = manual_remaining
+        if manual_reset_text:
+            payload["manual_reset_text"] = manual_reset_text
         console.print(format_status_line(payload, fmt))
         return 0
 
@@ -1288,15 +1313,22 @@ def command_set_remaining_from_clipboard() -> int:
     return command_set_remaining(percent)
 
 
-def extract_usage_percent_from_text(text: str) -> float | None:
+def extract_usage_info_from_text(text: str) -> tuple[float | None, str | None]:
     lines = text.splitlines()
     for i, line in enumerate(lines):
         if "current session" in line.lower():
+            used_percent: float | None = None
+            reset_text: str | None = None
             for j in range(i, min(i + 6, len(lines))):
                 m = re.search(r"(?<!\d)(100|[1-9]?\d)\s*%\s*used", lines[j], flags=re.IGNORECASE)
                 if m:
                     used = float(m.group(1))
-                    return max(0.0, 100.0 - used)
+                    used_percent = used
+                r = re.search(r"^\s*Resets\s+(.+?)\s*$", lines[j], flags=re.IGNORECASE)
+                if r:
+                    reset_text = r.group(1).strip()
+            if used_percent is not None:
+                return max(0.0, 100.0 - used_percent), reset_text
 
     candidates: list[tuple[int, float]] = []
     for line in lines:
@@ -1320,9 +1352,9 @@ def extract_usage_percent_from_text(text: str) -> float | None:
             score = 1
         candidates.append((score, percent))
     if not candidates:
-        return None
+        return None, None
     candidates.sort(key=lambda item: item[0], reverse=True)
-    return candidates[0][1]
+    return candidates[0][1], None
 
 
 def tmux_has_session(name: str) -> bool:
@@ -1337,17 +1369,17 @@ def ensure_usage_tmux_session(name: str, cwd: str) -> None:
     time.sleep(1.0)
 
 
-def tmux_request_usage_percent(name: str, settle_sec: float = 1.4) -> float | None:
+def tmux_request_usage_info(name: str, settle_sec: float = 1.4) -> tuple[float | None, str | None]:
     if not tmux_has_session(name):
-        return None
+        return None, None
     subprocess.run(["tmux", "send-keys", "-t", name, "/usage", "Enter"], check=False)
     time.sleep(0.25)
     subprocess.run(["tmux", "send-keys", "-t", name, "Enter"], check=False)
     time.sleep(max(settle_sec, 0.6))
     proc = subprocess.run(["tmux", "capture-pane", "-pt", name, "-S", "-220"], capture_output=True, text=True)
     if proc.returncode != 0:
-        return None
-    result = extract_usage_percent_from_text(proc.stdout)
+        return None, None
+    result = extract_usage_info_from_text(proc.stdout)
     subprocess.run(["tmux", "send-keys", "-t", name, "Escape"], check=False)
     return result
 
@@ -1371,14 +1403,16 @@ def command_sync_remaining(
 
     console.print(f"[bold]sync-remaining[/bold] session={tmux_session} interval={interval:.1f}s")
     while not STOP:
-        percent = tmux_request_usage_percent(tmux_session)
+        percent, reset_text = tmux_request_usage_info(tmux_session)
         source = "tmux:/usage"
         if percent is None:
             percent = estimate_remaining_percent()
+            reset_text = read_manual_reset_text()
             source = "estimate"
         if percent is not None:
-            write_manual_remaining_percent(percent)
-            console.print(f"[cyan]remaining[/cyan] {percent:.0f}% ({source})")
+            write_manual_remaining_percent(percent, reset_text=reset_text)
+            reset_suffix = f", resets {reset_text}" if reset_text else ""
+            console.print(f"[cyan]remaining[/cyan] {percent:.0f}% ({source}{reset_suffix})")
         else:
             console.print("[yellow]remaining unavailable[/yellow] (/usage parse failed)")
         time.sleep(max(interval, 3.0))
