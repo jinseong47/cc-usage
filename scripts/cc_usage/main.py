@@ -59,6 +59,7 @@ SESSION_RE = re.compile(r"session(?:_id)?\s*[:=]\s*([A-Za-z0-9._:-]+)")
 REQUEST_RE = re.compile(r"request(?:_id)?\s*[:=]\s*([A-Za-z0-9._:-]+)")
 LATENCY_RE = re.compile(r"(?:latency_ms|duration_ms)\s*[:=]\s*(\d+)")
 PERCENT_RE = re.compile(r"(?<!\d)(100|[1-9]?\d)\s*%")
+ANSI_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
 
 @dataclass(frozen=True)
@@ -283,20 +284,36 @@ def parse_event_ts(value: Any) -> datetime:
 
 
 def parse_usage_event_from_json(data: dict[str, Any], project: str, default_model: str | None) -> UsageEvent | None:
-    model = nested_get(data, "model", "response.model", "meta.model", "usage.model")
+    model = nested_get(data, "model", "message.model", "response.model", "meta.model", "usage.model")
     if not model:
         model = default_model
     if not model:
         return None
 
-    usage_obj = nested_get(data, "usage")
+    usage_obj = nested_get(data, "usage", "message.usage")
     last_usage_obj = nested_get(data, "payload.info.last_token_usage")
     total_usage_obj = nested_get(data, "payload.info.total_token_usage")
     input_tokens = safe_int(
-        nested_get(data, "input_tokens", "prompt_tokens", "inputTokenCount", "token_usage.input_tokens")
+        nested_get(
+            data,
+            "input_tokens",
+            "prompt_tokens",
+            "inputTokenCount",
+            "token_usage.input_tokens",
+            "message.usage.input_tokens",
+            "message.usage.prompt_tokens",
+        )
     )
     output_tokens = safe_int(
-        nested_get(data, "output_tokens", "completion_tokens", "outputTokenCount", "token_usage.output_tokens")
+        nested_get(
+            data,
+            "output_tokens",
+            "completion_tokens",
+            "outputTokenCount",
+            "token_usage.output_tokens",
+            "message.usage.output_tokens",
+            "message.usage.completion_tokens",
+        )
     )
     if isinstance(usage_obj, dict):
         if input_tokens is None:
@@ -336,6 +353,7 @@ def parse_usage_event_from_json(data: dict[str, Any], project: str, default_mode
     session_id = nested_get(
         data,
         "session_id",
+        "sessionId",
         "session.id",
         "metadata.session_id",
         "conversation_id",
@@ -343,12 +361,14 @@ def parse_usage_event_from_json(data: dict[str, Any], project: str, default_mode
     request_id = nested_get(
         data,
         "request_id",
+        "requestId",
         "id",
+        "message.id",
         "response_id",
         "request.id",
     )
     latency_ms = safe_int(nested_get(data, "latency_ms", "duration_ms", "meta.latency_ms"))
-    ts = parse_event_ts(nested_get(data, "ts", "timestamp", "created_at", "time"))
+    ts = parse_event_ts(nested_get(data, "ts", "timestamp", "created_at", "time", "message.timestamp"))
 
     return UsageEvent(
         ts=ts,
@@ -1185,6 +1205,10 @@ def command_daemon(
     no_rollup: bool,
     status_file: str | None,
     status_interval: float,
+    usage_sync_interval: float,
+    usage_tmux_session: str,
+    usage_tmux_cwd: str | None,
+    no_usage_probe: bool,
     once: bool,
 ) -> int:
     signal.signal(signal.SIGINT, _handle_signal)
@@ -1198,17 +1222,25 @@ def command_daemon(
     default_model_name = default_model or os.getenv("CC_USAGE_DEFAULT_MODEL", "claude-opus-4-6")
     session_hint = source_path.stem.rsplit("-", 1)[-1] if source_path.suffix == ".jsonl" else None
     status_path = Path(status_file).expanduser().resolve() if status_file else default_status_file()
+    usage_cwd = usage_tmux_cwd or str(Path.home())
     session_id_filter = None
 
     console.print(f"[bold]daemon[/bold] source={source_key}")
     console.print(
         f"project={project_name} | status_file={status_path} | default_model={default_model_name} | rollup={'off' if no_rollup else 'on'}"
     )
+    if no_usage_probe:
+        console.print("usage_probe=off")
+    else:
+        console.print(
+            f"usage_probe=on | usage_session={usage_tmux_session} | usage_interval={max(usage_sync_interval, 3.0):.1f}s"
+        )
 
     with connect(cfg) as conn:
         offset: int | None = None
         last_ingest_at: datetime | None = None
         last_status_write = 0.0
+        last_usage_sync = 0.0
 
         while not STOP:
             collector_state = "OK"
@@ -1240,6 +1272,17 @@ def command_daemon(
                     last_ingest_at = datetime.now(timezone.utc)
 
             now_ts = time.time()
+            if not no_usage_probe and (now_ts - last_usage_sync >= max(usage_sync_interval, 3.0)):
+                try:
+                    ensure_usage_tmux_session(usage_tmux_session, usage_cwd)
+                    remaining_percent, reset_text = tmux_request_usage_info(usage_tmux_session)
+                    if remaining_percent is not None:
+                        write_manual_remaining_percent(remaining_percent, reset_text=reset_text)
+                except Exception:
+                    # Keep daemon alive even when tmux/claude probe fails transiently.
+                    pass
+                last_usage_sync = now_ts
+
             if now_ts - last_status_write >= max(status_interval, 0.5):
                 status_snapshot = build_status_snapshot(
                     conn=conn,
@@ -1314,7 +1357,8 @@ def command_set_remaining_from_clipboard() -> int:
 
 
 def extract_usage_info_from_text(text: str) -> tuple[float | None, str | None]:
-    lines = text.splitlines()
+    clean_text = ANSI_RE.sub("", text).replace("\r", "")
+    lines = clean_text.splitlines()
     for i, line in enumerate(lines):
         if "current session" in line.lower():
             used_percent: float | None = None
@@ -1329,32 +1373,7 @@ def extract_usage_info_from_text(text: str) -> tuple[float | None, str | None]:
                     reset_text = r.group(1).strip()
             if used_percent is not None:
                 return max(0.0, 100.0 - used_percent), reset_text
-
-    candidates: list[tuple[int, float]] = []
-    for line in lines:
-        m = PERCENT_RE.search(line)
-        if not m:
-            continue
-        percent = float(m.group(1))
-        score = 0
-        lower = line.lower()
-        if "usage" in lower:
-            score += 4
-        if "used" in lower:
-            score += 2
-        if "remaining" in lower or "잔여" in line or "남은" in line:
-            score += 4
-        if "5h" in lower or "5시간" in line or "5-hour" in lower:
-            score += 4
-        if "rate" in lower or "limit" in lower:
-            score += 2
-        if score == 0:
-            score = 1
-        candidates.append((score, percent))
-    if not candidates:
-        return None, None
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    return candidates[0][1], None
+    return None, None
 
 
 def tmux_has_session(name: str) -> bool:
@@ -1372,16 +1391,36 @@ def ensure_usage_tmux_session(name: str, cwd: str) -> None:
 def tmux_request_usage_info(name: str, settle_sec: float = 1.4) -> tuple[float | None, str | None]:
     if not tmux_has_session(name):
         return None, None
-    subprocess.run(["tmux", "send-keys", "-t", name, "/usage", "Enter"], check=False)
-    time.sleep(0.25)
-    subprocess.run(["tmux", "send-keys", "-t", name, "Enter"], check=False)
-    time.sleep(max(settle_sec, 0.6))
-    proc = subprocess.run(["tmux", "capture-pane", "-pt", name, "-S", "-220"], capture_output=True, text=True)
-    if proc.returncode != 0:
-        return None, None
-    result = extract_usage_info_from_text(proc.stdout)
+    settle = max(settle_sec, 0.6)
+
+    def capture_text() -> str:
+        proc = subprocess.run(["tmux", "capture-pane", "-pt", name, "-S", "-260"], capture_output=True, text=True)
+        return proc.stdout if proc.returncode == 0 else ""
+
+    for _ in range(3):
+        # Normalize state before opening /usage dialog.
+        subprocess.run(["tmux", "send-keys", "-t", name, "Escape"], check=False)
+        time.sleep(0.1)
+        subprocess.run(["tmux", "send-keys", "-t", name, "/usage", "Enter"], check=False)
+        time.sleep(settle)
+        text = capture_text()
+
+        # If slash command menu opened instead of executing, confirm selection once.
+        if "Show plan usage limits" in text and "Current session" not in text:
+            subprocess.run(["tmux", "send-keys", "-t", name, "Enter"], check=False)
+            time.sleep(settle)
+            text = capture_text()
+
+        remaining, reset_text = extract_usage_info_from_text(text)
+        if remaining is not None:
+            subprocess.run(["tmux", "send-keys", "-t", name, "Escape"], check=False)
+            return remaining, reset_text
+
+    # Final best-effort parse of whatever is visible.
+    text = capture_text()
+    remaining, reset_text = extract_usage_info_from_text(text)
     subprocess.run(["tmux", "send-keys", "-t", name, "Escape"], check=False)
-    return result
+    return remaining, reset_text
 
 
 def estimate_remaining_percent() -> float | None:
@@ -1514,6 +1553,12 @@ def parse_args() -> argparse.Namespace:
     daemon.add_argument("--no-rollup", action="store_true", help="disable minute rollup upsert")
     daemon.add_argument("--status-file", help="status cache output path (default: ~/.cache/cc-usage/status.json)")
     daemon.add_argument("--status-interval", type=float, default=1.0, help="status file refresh interval in seconds")
+    daemon.add_argument(
+        "--usage-sync-interval", type=float, default=20.0, help="Claude /usage polling interval in seconds"
+    )
+    daemon.add_argument("--usage-tmux-session", default="cc-usage-probe", help="tmux session name for /usage polling")
+    daemon.add_argument("--usage-tmux-cwd", help="cwd for auto-created usage probe tmux session")
+    daemon.add_argument("--no-usage-probe", action="store_true", help="disable tmux /usage probe in daemon")
     daemon.add_argument("--once", action="store_true", help="run one collection/status cycle and exit")
 
     status = subparsers.add_parser("status", help="print one-line status for terminal status bars")
@@ -1577,6 +1622,10 @@ def main() -> int:
                 no_rollup=args.no_rollup,
                 status_file=args.status_file,
                 status_interval=args.status_interval,
+                usage_sync_interval=args.usage_sync_interval,
+                usage_tmux_session=args.usage_tmux_session,
+                usage_tmux_cwd=args.usage_tmux_cwd,
+                no_usage_probe=args.no_usage_probe,
                 once=args.once,
             )
         if args.command == "status":

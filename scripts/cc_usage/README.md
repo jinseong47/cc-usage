@@ -21,10 +21,12 @@ export DATABASE_URL='<YOUR_DATABASE_URL>'
 python3 scripts/cc_usage/main.py init-db
 ```
 
-## 4) 통합 데몬 실행
+## 4) Claude 실행 래퍼 등록(자동 시작/종료)
 
 ```bash
-python3 scripts/cc_usage/main.py daemon --project codex-local
+chmod +x /Users/ijinseong/Documents/golf/dy_golfcart_monitoring/scripts/cc_usage/cc-claude
+echo "alias claude='/Users/ijinseong/Documents/golf/dy_golfcart_monitoring/scripts/cc_usage/cc-claude'" >> ~/.zshrc
+source ~/.zshrc
 ```
 
 ## 5) 상태 확인
@@ -32,6 +34,10 @@ python3 scripts/cc_usage/main.py daemon --project codex-local
 ```bash
 python3 scripts/cc_usage/main.py status --format plain
 ```
+
+`claude` 실행 시:
+- 첫 세션 시작: `cc-usage daemon` 자동 시작
+- 마지막 세션 종료: `cc-usage daemon` 자동 종료
 
 ## 6) tmux 하단 상태바 표시
 
