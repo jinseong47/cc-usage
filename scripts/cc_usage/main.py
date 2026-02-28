@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -52,6 +53,7 @@ except ModuleNotFoundError:  # pragma: no cover
 
 console = Console()
 STOP = False
+LOCK_HANDLES: dict[str, Any] = {}
 MODEL_RE = re.compile(r"model\s*[:=]\s*([A-Za-z0-9._:-]+)")
 INPUT_RE = re.compile(r"(?:input_tokens|prompt_tokens)\s*[:=]\s*(\d+)")
 OUTPUT_RE = re.compile(r"(?:output_tokens|completion_tokens)\s*[:=]\s*(\d+)")
@@ -167,6 +169,32 @@ def atomic_write_text(path: Path, text: str) -> None:
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(text, encoding="utf-8")
     tmp_path.replace(path)
+
+
+def default_lock_file(name: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", name).strip("-") or "default"
+    return Path(os.path.expanduser(f"~/.cache/cc-usage/locks/{safe}.lock")).resolve()
+
+
+def acquire_single_instance_lock(name: str, holder: str) -> Path:
+    lock_path = default_lock_file(name)
+    ensure_parent_dir(lock_path)
+    fh = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        fh.seek(0)
+        existing = fh.read().strip()
+        fh.close()
+        detail = f" ({existing})" if existing else ""
+        raise RuntimeError(f"another '{name}' process is already running{detail}") from exc
+
+    fh.seek(0)
+    fh.truncate()
+    fh.write(f"pid={os.getpid()} holder={holder} started_at={datetime.now(timezone.utc).isoformat()}\n")
+    fh.flush()
+    LOCK_HANDLES[name] = fh
+    return lock_path
 
 
 def default_status_file() -> Path:
@@ -1213,6 +1241,9 @@ def command_daemon(
 ) -> int:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
+    acquire_single_instance_lock("cc-usage-daemon", f"daemon project={project or 'default'}")
+    if not no_usage_probe:
+        acquire_single_instance_lock("cc-usage-remaining-sync", f"daemon usage_session={usage_tmux_session}")
 
     source_path, auto_source = resolve_source_file(source_file)
     if source_path is None:
@@ -1363,9 +1394,12 @@ def extract_usage_info_from_text(text: str) -> tuple[float | None, str | None]:
         if "current session" in line.lower():
             used_percent: float | None = None
             reset_text: str | None = None
-            for j in range(i, min(i + 6, len(lines))):
+            for j in range(i + 1, min(i + 14, len(lines))):
+                lower_line = lines[j].lower()
+                if "current week" in lower_line:
+                    break
                 m = re.search(r"(?<!\d)(100|[1-9]?\d)\s*%\s*used", lines[j], flags=re.IGNORECASE)
-                if m:
+                if m and used_percent is None:
                     used = float(m.group(1))
                     used_percent = used
                 r = re.search(r"^\s*Resets\s+(.+?)\s*$", lines[j], flags=re.IGNORECASE)
@@ -1397,24 +1431,37 @@ def tmux_request_usage_info(name: str, settle_sec: float = 1.4) -> tuple[float |
         proc = subprocess.run(["tmux", "capture-pane", "-pt", name, "-S", "-260"], capture_output=True, text=True)
         return proc.stdout if proc.returncode == 0 else ""
 
+    def maybe_accept_trust_prompt(text: str) -> str:
+        lower = text.lower()
+        if "quick safety check" in lower and "yes, i trust this folder" in lower:
+            subprocess.run(["tmux", "send-keys", "-t", name, "Enter"], check=False)
+            time.sleep(settle)
+            return capture_text()
+        return text
+
     for _ in range(3):
         # Normalize state before opening /usage dialog.
         subprocess.run(["tmux", "send-keys", "-t", name, "Escape"], check=False)
         time.sleep(0.1)
+        _ = maybe_accept_trust_prompt(capture_text())
         subprocess.run(["tmux", "send-keys", "-t", name, "/usage", "Enter"], check=False)
-        time.sleep(settle)
-        text = capture_text()
+        menu_confirmed = False
+        deadline = time.time() + max(5.0, settle * 4.0)
 
-        # If slash command menu opened instead of executing, confirm selection once.
-        if "Show plan usage limits" in text and "Current session" not in text:
-            subprocess.run(["tmux", "send-keys", "-t", name, "Enter"], check=False)
-            time.sleep(settle)
-            text = capture_text()
+        while time.time() < deadline:
+            time.sleep(0.35)
+            text = maybe_accept_trust_prompt(capture_text())
 
-        remaining, reset_text = extract_usage_info_from_text(text)
-        if remaining is not None:
-            subprocess.run(["tmux", "send-keys", "-t", name, "Escape"], check=False)
-            return remaining, reset_text
+            # If slash command menu opened instead of executing, confirm selection once.
+            if "Show plan usage limits" in text and "Current session" not in text and not menu_confirmed:
+                subprocess.run(["tmux", "send-keys", "-t", name, "Enter"], check=False)
+                menu_confirmed = True
+                continue
+
+            remaining, reset_text = extract_usage_info_from_text(text)
+            if remaining is not None:
+                subprocess.run(["tmux", "send-keys", "-t", name, "Escape"], check=False)
+                return remaining, reset_text
 
     # Final best-effort parse of whatever is visible.
     text = capture_text()
@@ -1436,6 +1483,7 @@ def command_sync_remaining(
 ) -> int:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
+    acquire_single_instance_lock("cc-usage-remaining-sync", f"sync-remaining session={tmux_session}")
     cwd = tmux_cwd or str(Path.home())
     if not no_tmux_bootstrap:
         ensure_usage_tmux_session(tmux_session, cwd)
